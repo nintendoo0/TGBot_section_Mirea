@@ -1,4 +1,4 @@
-BOT_TOKEN = "8604427052:AAH1fi6OnirW3ZCcIr3qnMx13v_Y5Z4PAIo"
+
 
 # Можно указать:
 # 1) публичный username канала, например "@my_volley_channel"
