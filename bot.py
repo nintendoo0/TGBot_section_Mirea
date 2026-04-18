@@ -10,6 +10,7 @@ from aiogram.types import Message
 
 from config import BOT_TOKEN, CHANNEL_ID, OWNER_ID, DB_PATH
 from database import Database
+from scheduler import moscow_now, parse_publish_datetime_msk, to_iso
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,6 +27,7 @@ class CreateTrainingStates(StatesGroup):
     waiting_for_time = State()
     waiting_for_capacity = State()
     waiting_for_level = State()
+    waiting_for_publish_time = State()
     waiting_for_confirm = State()
 
 
@@ -320,19 +322,63 @@ async def state_training_level(message: Message, state: FSMContext):
         return
 
     await state.update_data(level=level)
+    await state.set_state(CreateTrainingStates.waiting_for_publish_time)
+    await message.answer(
+        "Когда опубликовать пост в канале?\n\n"
+        "Напишите:\n"
+        "• сразу\n"
+        "или\n"
+        "• ДД.ММ.ГГГГ ЧЧ:ММ (по Москве)\n\n"
+        "Пример: 25.04.2026 12:30"
+    )
+@dp.message(CreateTrainingStates.waiting_for_publish_time, F.chat.type == "private")
+async def state_training_publish_time(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав.")
+        return
+
+    text = normalize_spaces(message.text or "")
+    lower = text.lower()
+
+    if lower in ("сразу", "now", "сейчас"):
+        await state.update_data(publish_at=None, publish_status="published")
+    else:
+        dt = parse_publish_datetime_msk(text)
+        if not dt:
+            await message.answer(
+                "Неверный формат.\n"
+                "Напишите 'сразу' или дату-время в формате ДД.ММ.ГГГГ ЧЧ:ММ (по Москве).\n"
+                "Пример: 25.04.2026 12:30"
+            )
+            return
+
+        if dt <= moscow_now():
+            await message.answer("Время публикации должно быть в будущем (по Москве).")
+            return
+
+        await state.update_data(publish_at=to_iso(dt), publish_status="scheduled")
+
     data = await state.get_data()
+
+    publish_line = (
+        "Публикация: сразу"
+        if not data.get("publish_at")
+        else f"Публикация (MSK): {data['publish_at']}"
+    )
 
     preview = (
         "Проверьте данные:\n\n"
         f"Дата: {data['training_date']}\n"
         f"Время: {data['training_time']}\n"
         f"Лимит: {data['capacity']}\n"
-        f"Уровень: {data['level']}\n\n"
-        "Напишите Да для публикации или /cancel для отмены."
+        f"Уровень: {data['level']}\n"
+        f"{publish_line}\n\n"
+        "Напишите Да для продолжения или /cancel для отмены."
     )
 
     await state.set_state(CreateTrainingStates.waiting_for_confirm)
     await message.answer(preview)
+
 
 
 @dp.message(CreateTrainingStates.waiting_for_confirm, F.chat.type == "private")
@@ -354,10 +400,27 @@ async def state_training_confirm(message: Message, state: FSMContext, bot: Bot):
         capacity=data["capacity"],
         level=data["level"],
         created_by=message.from_user.id,
+        publish_at=data.get("publish_at"),
+        publish_status=data.get("publish_status") or "published",
     )
 
     training = db.get_training_by_id(training_id)
+    if training.get("publish_status") == "scheduled":
+        await state.clear()
+        await message.answer(
+            "Запись создана и будет опубликована позже.\n\n"
+            f"{build_training_brief(training)}\n"
+            f"Публикация (MSK): {training['publish_at']}"
+        )
 
+        await notify_admins(
+            bot,
+            "🕓 Запись создана и запланирована к публикации.\n\n"
+            f"{build_training_brief(training)}\n"
+            f"Публикация (MSK): {training['publish_at']}",
+            exclude_user_id=None,
+        )
+        return
     try:
         sent = await bot.send_message(
             chat_id=CHANNEL_ID,
@@ -769,13 +832,46 @@ async def handle_channel_direct_messages(message: Message, bot: Bot):
         "• Мой номер — статус записи\n"
         "• Отмена — отменить запись"
     )
+async def publisher_loop(bot: Bot):
+    while True:
+        try:
+            now_value = to_iso(moscow_now())
+            due = db.get_scheduled_trainings_due(now_value)
 
+            for training in due:
+                try:
+                    sent = await bot.send_message(
+                        chat_id=CHANNEL_ID,
+                        text=build_channel_post(training),
+                    )
+                except Exception as e:
+                    logging.warning(
+                        "Не удалось опубликовать запланированный пост (training_id=%s): %s",
+                        training["id"],
+                        e,
+                    )
+                    continue
+
+                db.set_channel_message_id(training["id"], sent.message_id)
+                db.mark_training_published(training["id"])
+
+                await notify_admins(
+                    bot,
+                    "🟢 Опубликована запланированная запись на тренировку.\n\n"
+                    f"{build_training_brief(training)}",
+                    exclude_user_id=None,
+                )
+        except Exception as e:
+            logging.warning("publisher_loop: %s", e)
+
+        await asyncio.sleep(20)
 
 async def main():
     if BOT_TOKEN == "ВСТАВЬ_СЮДА_ТОКЕН_БОТА":
         raise ValueError("Укажи BOT_TOKEN в config.py")
 
     bot = Bot(BOT_TOKEN)
+    asyncio.create_task(publisher_loop(bot))
     await dp.start_polling(bot)
 
 

@@ -57,7 +57,17 @@ class Database:
                 );
                 """
             )
-
+            # Мягкая миграция (для существующей БД) — отложенная публикация
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(trainings)").fetchall()
+            }
+            if "publish_at" not in columns:
+                conn.execute("ALTER TABLE trainings ADD COLUMN publish_at TEXT")
+            if "publish_status" not in columns:
+                conn.execute(
+                    "ALTER TABLE trainings ADD COLUMN publish_status TEXT NOT NULL DEFAULT 'published'"
+                )
     def ensure_owner(self, owner_id: int):
         if not owner_id or owner_id <= 0:
             return
@@ -160,17 +170,29 @@ class Database:
         capacity: int,
         level: str,
         created_by: int,
+        publish_at: str | None = None,
+        publish_status: str = "published",
     ) -> int:
         with self._connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO trainings (
                     training_date, training_time, capacity, level,
-                    status, created_by, created_at
+                    status, created_by, created_at,
+                    publish_at, publish_status
                 )
-                VALUES (?, ?, ?, ?, 'open', ?, ?)
+                VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?)
                 """,
-                (training_date, training_time, capacity, level, created_by, now_iso()),
+                (
+                    training_date,
+                    training_time,
+                    capacity,
+                    level,
+                    created_by,
+                    now_iso(),
+                    publish_at,
+                    publish_status,
+                ),
             )
             return cursor.lastrowid
 
@@ -423,4 +445,27 @@ class Database:
             conn.execute(
                 "UPDATE registrations SET queue_number = ? WHERE id = ?",
                 (index, row["id"]),
+            )
+    def get_scheduled_trainings_due(self, now_iso_value: str):
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM trainings
+                WHERE status = 'open'
+                  AND publish_status = 'scheduled'
+                  AND publish_at IS NOT NULL
+                  AND publish_at <= ?
+                  AND channel_message_id IS NULL
+                ORDER BY publish_at ASC, id ASC
+                """,
+                (now_iso_value,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def mark_training_published(self, training_id: int):
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE trainings SET publish_status = 'published' WHERE id = ?",
+                (training_id,),
             )
