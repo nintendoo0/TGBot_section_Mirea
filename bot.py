@@ -184,11 +184,13 @@ def private_help_text(user_id: int) -> str:
     if is_admin(user_id):
         base.extend(
             [
-                "/new_training — открыть новую запись",
+                "/new_training — открыть новую запись (сразу или по расписанию)",
                 "/close_training — закрыть текущую запись",
                 "/training — показать текущую тренировку",
                 "/list — основной список",
                 "/waiting — лист ожидания",
+                "/kick a3 — удалить №3 из основного списка",
+                "/kick w3 — удалить №3 из листа ожидания",
                 "/admins — список админов",
                 "/cancel — отменить текущий пошаговый ввод",
             ]
@@ -331,6 +333,8 @@ async def state_training_level(message: Message, state: FSMContext):
         "• ДД.ММ.ГГГГ ЧЧ:ММ (по Москве)\n\n"
         "Пример: 25.04.2026 12:30"
     )
+
+
 @dp.message(CreateTrainingStates.waiting_for_publish_time, F.chat.type == "private")
 async def state_training_publish_time(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -380,7 +384,6 @@ async def state_training_publish_time(message: Message, state: FSMContext):
     await message.answer(preview)
 
 
-
 @dp.message(CreateTrainingStates.waiting_for_confirm, F.chat.type == "private")
 async def state_training_confirm(message: Message, state: FSMContext, bot: Bot):
     if not is_admin(message.from_user.id):
@@ -389,7 +392,7 @@ async def state_training_confirm(message: Message, state: FSMContext, bot: Bot):
 
     answer = normalize_spaces(message.text or "").lower()
     if answer not in ("да", "yes", "ok", "ок"):
-        await message.answer("Напишите Да для публикации или /cancel для отмены.")
+        await message.answer("Напишите Да для продолжения или /cancel для отмены.")
         return
 
     data = await state.get_data()
@@ -405,6 +408,7 @@ async def state_training_confirm(message: Message, state: FSMContext, bot: Bot):
     )
 
     training = db.get_training_by_id(training_id)
+
     if training.get("publish_status") == "scheduled":
         await state.clear()
         await message.answer(
@@ -418,9 +422,10 @@ async def state_training_confirm(message: Message, state: FSMContext, bot: Bot):
             "🕓 Запись создана и запланирована к публикации.\n\n"
             f"{build_training_brief(training)}\n"
             f"Публикация (MSK): {training['publish_at']}",
-            exclude_user_id=None,
+            exclude_user_id=message.from_user.id,
         )
         return
+
     try:
         sent = await bot.send_message(
             chat_id=CHANNEL_ID,
@@ -447,7 +452,7 @@ async def state_training_confirm(message: Message, state: FSMContext, bot: Bot):
         bot,
         "🟢 Открыта новая запись на тренировку.\n\n"
         f"{build_training_brief(training)}",
-        exclude_user_id=None,
+        exclude_user_id=message.from_user.id,
     )
 
 
@@ -477,7 +482,7 @@ async def cmd_close_training(message: Message, bot: Bot):
         bot,
         "⛔ Запись на тренировку закрыта.\n\n"
         f"{build_training_brief(training)}",
-        exclude_user_id=None,
+        exclude_user_id=message.from_user.id,
     )
 
 
@@ -538,6 +543,62 @@ async def cmd_waiting(message: Message):
     await message.answer(render_registrations("Лист ожидания:", waiting))
 
 
+@dp.message(Command("kick"), F.chat.type == "private")
+async def cmd_kick(message: Message, bot: Bot):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав для этой команды.")
+        return
+
+    training = db.get_open_training()
+    if not training:
+        await message.answer("Сейчас нет открытой тренировки.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /kick a3 или /kick w3")
+        return
+
+    raw = normalize_spaces(parts[1]).lower().replace(" ", "")
+    if len(raw) < 2 or raw[0] not in ("a", "w") or not raw[1:].isdigit():
+        await message.answer("Неверный формат. Использование: /kick a3 или /kick w3")
+        return
+
+    list_name = "active" if raw[0] == "a" else "waiting"
+    queue_number = int(raw[1:])
+
+    result = db.admin_kick_by_queue(training["id"], list_name, queue_number)
+    if not result["ok"]:
+        await message.answer("Не найден участник с таким номером в выбранном списке.")
+        return
+
+    removed = result["removed"]
+    promoted = result.get("promoted")
+
+    who = removed.get("fio") or f"id {removed.get('user_id')}"
+    await message.answer(f"Удалён(а): {who} из {list_name} (№{queue_number}).")
+
+    await notify_admins(
+        bot,
+        f"🗑 Админ удалил участника из {list_name}:\n{who} (№{queue_number})",
+        exclude_user_id=message.from_user.id,
+    )
+
+    if promoted:
+        # уведомим поднятого из ожидания (в его DM-топик)
+        try:
+            await send_to_dm_topic(
+                bot,
+                promoted["dm_chat_id"],
+                promoted["dm_topic_id"],
+                "✅ Для вас освободилось место.\n"
+                "Вы переведены из листа ожидания в основной список.\n"
+                f"Ваш новый номер: {promoted['queue_number']}",
+            )
+        except Exception as e:
+            logging.warning("Не удалось уведомить promoted user: %s", e)
+
+
 @dp.message(Command("admins"), F.chat.type == "private")
 async def cmd_admins(message: Message):
     if not is_admin(message.from_user.id):
@@ -573,7 +634,7 @@ async def cmd_add_admin(message: Message):
         await message.answer("user_id должен быть числом.")
         return
 
-    success, info = db.add_admin(target_id, message.from_user.id)
+    _, info = db.add_admin(target_id, message.from_user.id)
     await message.answer(info)
 
 
@@ -594,7 +655,7 @@ async def cmd_remove_admin(message: Message):
         await message.answer("user_id должен быть числом.")
         return
 
-    success, info = db.remove_admin(target_id)
+    _, info = db.remove_admin(target_id)
     await message.answer(info)
 
 
@@ -618,7 +679,7 @@ async def handle_channel_direct_messages(message: Message, bot: Bot):
     training = db.get_open_training()
 
     if lower in ("/start", "старт", "help", "/help"):
-        if training:
+        if training and training.get("publish_status", "published") == "published":
             counts = db.get_counts(training["id"])
             await reply_to_channel_dm(
                 bot,
@@ -640,7 +701,7 @@ async def handle_channel_direct_messages(message: Message, bot: Bot):
         return
 
     if lower.startswith("секция"):
-        if not training:
+        if not training or training.get("publish_status", "published") != "published":
             await reply_to_channel_dm(
                 bot,
                 message,
@@ -722,7 +783,7 @@ async def handle_channel_direct_messages(message: Message, bot: Bot):
         return
 
     if lower in ("отмена", "/отмена", "/cancel"):
-        if not training:
+        if not training or training.get("publish_status", "published") != "published":
             await reply_to_channel_dm(
                 bot,
                 message,
@@ -745,12 +806,6 @@ async def handle_channel_direct_messages(message: Message, bot: Bot):
             "Ваша запись отменена."
         )
 
-        await notify_admins(
-            bot,
-            f"Отменена запись: {result['cancelled_fio']}",
-            exclude_user_id=None,
-        )
-
         promoted = result.get("promoted")
         if promoted:
             await send_to_dm_topic(
@@ -762,16 +817,10 @@ async def handle_channel_direct_messages(message: Message, bot: Bot):
                 f"Ваш новый номер: {promoted['queue_number']}"
             )
 
-            await notify_admins(
-                bot,
-                f"Из листа ожидания переведён участник: {promoted['fio']}\n"
-                f"Новый номер: {promoted['queue_number']}",
-                exclude_user_id=None,
-            )
         return
 
     if lower in ("инфо", "/info"):
-        if not training:
+        if not training or training.get("publish_status", "published") != "published":
             await reply_to_channel_dm(
                 bot,
                 message,
@@ -790,7 +839,7 @@ async def handle_channel_direct_messages(message: Message, bot: Bot):
         return
 
     if lower in ("мой номер", "моя запись", "/status", "/my"):
-        if not training:
+        if not training or training.get("publish_status", "published") != "published":
             await reply_to_channel_dm(
                 bot,
                 message,
@@ -832,6 +881,8 @@ async def handle_channel_direct_messages(message: Message, bot: Bot):
         "• Мой номер — статус записи\n"
         "• Отмена — отменить запись"
     )
+
+
 async def publisher_loop(bot: Bot):
     while True:
         try:
@@ -865,6 +916,7 @@ async def publisher_loop(bot: Bot):
             logging.warning("publisher_loop: %s", e)
 
         await asyncio.sleep(20)
+
 
 async def main():
     if BOT_TOKEN == "ВСТАВЬ_СЮДА_ТОКЕН_БОТА":

@@ -57,6 +57,7 @@ class Database:
                 );
                 """
             )
+
             # Мягкая миграция (для существующей БД) — отложенная публикация
             columns = {
                 row["name"]
@@ -68,6 +69,7 @@ class Database:
                 conn.execute(
                     "ALTER TABLE trainings ADD COLUMN publish_status TEXT NOT NULL DEFAULT 'published'"
                 )
+
     def ensure_owner(self, owner_id: int):
         if not owner_id or owner_id <= 0:
             return
@@ -359,28 +361,7 @@ class Database:
             )
 
             if registration["status"] == "active":
-                waiting_row = conn.execute(
-                    """
-                    SELECT *
-                    FROM registrations
-                    WHERE training_id = ?
-                      AND status = 'waiting'
-                    ORDER BY id
-                    LIMIT 1
-                    """,
-                    (training_id,),
-                ).fetchone()
-
-                if waiting_row:
-                    conn.execute(
-                        """
-                        UPDATE registrations
-                        SET status = 'active'
-                        WHERE id = ?
-                        """,
-                        (waiting_row["id"],),
-                    )
-                    promoted = dict(waiting_row)
+                promoted = self._promote_first_waiting_conn(conn, training_id)
 
             self._normalize_numbers_conn(conn, training_id)
 
@@ -446,6 +427,30 @@ class Database:
                 "UPDATE registrations SET queue_number = ? WHERE id = ?",
                 (index, row["id"]),
             )
+
+    def _promote_first_waiting_conn(self, conn, training_id: int):
+        waiting_row = conn.execute(
+            """
+            SELECT *
+            FROM registrations
+            WHERE training_id = ?
+              AND status = 'waiting'
+            ORDER BY id
+            LIMIT 1
+            """,
+            (training_id,),
+        ).fetchone()
+
+        if not waiting_row:
+            return None
+
+        conn.execute(
+            "UPDATE registrations SET status = 'active' WHERE id = ?",
+            (waiting_row["id"],),
+        )
+        return dict(waiting_row)
+
+    # --- отложенная публикация ---
     def get_scheduled_trainings_due(self, now_iso_value: str):
         with self._connect() as conn:
             rows = conn.execute(
@@ -469,3 +474,54 @@ class Database:
                 "UPDATE trainings SET publish_status = 'published' WHERE id = ?",
                 (training_id,),
             )
+
+    # --- kick ---
+    def admin_kick_by_queue(
+        self,
+        training_id: int,
+        list_name: str,  # 'active' | 'waiting'
+        queue_number: int,
+    ):
+        if list_name not in ("active", "waiting"):
+            raise ValueError("list_name must be 'active' or 'waiting'")
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM registrations
+                WHERE training_id = ?
+                  AND status = ?
+                  AND queue_number = ?
+                """,
+                (training_id, list_name, queue_number),
+            ).fetchone()
+
+            if not row:
+                return {"ok": False, "reason": "not_found"}
+
+            row = dict(row)
+
+            conn.execute(
+                """
+                UPDATE registrations
+                SET status = 'cancelled', cancelled_at = ?
+                WHERE id = ?
+                """,
+                (now_iso(), row["id"]),
+            )
+
+            promoted = None
+            if list_name == "active":
+                promoted = self._promote_first_waiting_conn(conn, training_id)
+
+            self._normalize_numbers_conn(conn, training_id)
+
+            if promoted:
+                promoted = conn.execute(
+                    "SELECT * FROM registrations WHERE id = ?",
+                    (promoted["id"],),
+                ).fetchone()
+                promoted = dict(promoted)
+
+            return {"ok": True, "removed": row, "promoted": promoted}
