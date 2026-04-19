@@ -1,4 +1,4 @@
-
+BOT_TOKEN = "8604427052:AAH1fi6OnirW3ZCcIr3qnMx13v_Y5Z4PAIo"
 
 # Можно указать:
 # 1) публичный username канала, например "@my_volley_channel"
@@ -10,3 +10,6 @@ CHANNEL_ID = "@volleyballmirea"
 OWNER_ID = 1009958834
 
 DB_PATH = "volleyball_bot.db"
+
+# Разрешить aiohttp использовать системные переменные прокси (HTTP(S)_PROXY и т.п.)
+TRUST_ENV_PROXY = True
