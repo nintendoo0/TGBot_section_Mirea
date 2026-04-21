@@ -145,6 +145,25 @@ def render_registrations(title: str, items: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def users_can_register(training: dict | None) -> bool:
+    if not training:
+        return False
+    return training.get("status") == "open"
+
+
+def scheduled_registration_text(training: dict) -> str:
+    publish_at = training.get("publish_at")
+    when = f"Публикация (MSK): {publish_at}" if publish_at else "Публикация: позже"
+    return (
+        "ℹ️ Запись уже открыта, но пост в канале ещё не опубликован.\n"
+        "Это не мешает записываться через сообщения каналу.\n\n"
+        f"{build_training_brief(training)}\n"
+        f"{when}\n\n"
+        "Для записи отправьте:\n"
+        "Секция ФИО"
+    )
+
+
 async def notify_admins(bot: Bot, text: str, exclude_user_id: int | None = None):
     admins = db.list_admins()
     for admin in admins:
@@ -498,10 +517,26 @@ async def cmd_training(message: Message):
         return
 
     counts = db.get_counts(training["id"])
+
+    publish_status = training.get("publish_status", "published")
+    publish_line = (
+        "Публикация: уже опубликовано"
+        if publish_status == "published"
+        else f"Публикация (MSK): {training.get('publish_at') or 'не задано'}"
+    )
+
+    availability_line = (
+        "Запись для участников: открыта"
+        if users_can_register(training)
+        else "Запись для участников: закрыта"
+    )
+
     await message.answer(
         "Текущая открытая тренировка:\n\n"
         f"{build_training_brief(training)}\n\n"
-        f"{format_counts(training, counts)}"
+        f"{format_counts(training, counts)}\n\n"
+        f"{publish_line}\n"
+        f"{availability_line}"
     )
 
 
@@ -583,6 +618,20 @@ async def cmd_kick(message: Message, bot: Bot):
         f"🗑 Админ удалил участника из {list_name}:\n{who} (№{queue_number})",
         exclude_user_id=message.from_user.id,
     )
+
+    # Уведомим удалённого участника (в его DM-топик с каналом)
+    try:
+        removed_place = "основного списка" if list_name == "active" else "листа ожидания"
+        await send_to_dm_topic(
+            bot,
+            removed["dm_chat_id"],
+            removed["dm_topic_id"],
+            "⛔ Ваша запись на тренировку отменена администратором.\n\n"
+            f"{build_training_brief(training)}\n\n"
+            f"Вы были удалены из {removed_place} (№{queue_number}).",
+        )
+    except Exception as e:
+        logging.warning("Не удалось уведомить удалённого участника: %s", e)
 
     if promoted:
         # уведомим поднятого из ожидания (в его DM-топик)
@@ -679,8 +728,12 @@ async def handle_channel_direct_messages(message: Message, bot: Bot):
     training = db.get_open_training()
 
     if lower in ("/start", "старт", "help", "/help"):
-        if training and training.get("publish_status", "published") == "published":
+        if training and users_can_register(training):
             counts = db.get_counts(training["id"])
+            note = ""
+            if training.get("publish_status") == "scheduled":
+                note = "\n\n" + scheduled_registration_text(training)
+
             await reply_to_channel_dm(
                 bot,
                 message,
@@ -688,7 +741,8 @@ async def handle_channel_direct_messages(message: Message, bot: Bot):
                 f"{build_training_brief(training)}\n\n"
                 f"{format_counts(training, counts)}\n\n"
                 "Для записи отправьте:\n"
-                "Секция ФИО",
+                "Секция ФИО"
+                f"{note}",
             )
         else:
             await reply_to_channel_dm(
@@ -701,12 +755,8 @@ async def handle_channel_direct_messages(message: Message, bot: Bot):
         return
 
     if lower.startswith("секция"):
-        if not training or training.get("publish_status", "published") != "published":
-            await reply_to_channel_dm(
-                bot,
-                message,
-                "Сейчас запись закрыта."
-            )
+        if not training:
+            await reply_to_channel_dm(bot, message, "Сейчас запись закрыта.")
             return
 
         fio = parse_fio(text)
@@ -783,7 +833,7 @@ async def handle_channel_direct_messages(message: Message, bot: Bot):
         return
 
     if lower in ("отмена", "/отмена", "/cancel"):
-        if not training or training.get("publish_status", "published") != "published":
+        if not training or not users_can_register(training):
             await reply_to_channel_dm(
                 bot,
                 message,
@@ -820,7 +870,7 @@ async def handle_channel_direct_messages(message: Message, bot: Bot):
         return
 
     if lower in ("инфо", "/info"):
-        if not training or training.get("publish_status", "published") != "published":
+        if not training or not users_can_register(training):
             await reply_to_channel_dm(
                 bot,
                 message,
@@ -839,7 +889,7 @@ async def handle_channel_direct_messages(message: Message, bot: Bot):
         return
 
     if lower in ("мой номер", "моя запись", "/status", "/my"):
-        if not training or training.get("publish_status", "published") != "published":
+        if not training or not users_can_register(training):
             await reply_to_channel_dm(
                 bot,
                 message,
