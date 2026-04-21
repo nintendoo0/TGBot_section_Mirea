@@ -721,7 +721,9 @@ async def handle_channel_direct_messages(message: Message, bot: Bot):
             "Пример: Секция Иванов Иван Иванович",
         )
         return
-
+    if is_admin(message.from_user.id):
+        return
+    
     text = normalize_spaces(message.text)
     lower = text.lower()
 
@@ -922,15 +924,22 @@ async def handle_channel_direct_messages(message: Message, bot: Bot):
         await reply_to_channel_dm(bot, message, text_reply)
         return
 
-    await reply_to_channel_dm(
-        bot,
-        message,
-        "Доступные команды:\n"
-        "• Секция ФИО — записаться\n"
-        "• Инфо — информация о тренировке\n"
-        "• Мой номер — статус записи\n"
-        "• Отмена — отменить запись"
-    )
+# ...existing code...
+
+    if lower in ("команды", "/commands", "help", "/help"):
+        await reply_to_channel_dm(
+            bot,
+            message,
+            "Доступные команды:\n"
+            "• Секция ФИО — записаться\n"
+            "• Инфо — информация о тренировке\n"
+            "• Мой номер — статус записи\n"
+            "• Отмена — отменить запись"
+        )
+        return
+
+    # Если сообщение не является триггерной командой — молчим
+    return
 
 
 async def publisher_loop(bot: Bot):
