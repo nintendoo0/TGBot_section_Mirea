@@ -33,6 +33,7 @@ class Database:
                     training_time TEXT NOT NULL,
                     capacity INTEGER NOT NULL,
                     level TEXT NOT NULL,
+                    location TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'open',
                     channel_message_id INTEGER,
                     created_by INTEGER NOT NULL,
@@ -69,6 +70,8 @@ class Database:
                 conn.execute(
                     "ALTER TABLE trainings ADD COLUMN publish_status TEXT NOT NULL DEFAULT 'published'"
                 )
+            if "location" not in columns:
+                conn.execute("ALTER TABLE trainings ADD COLUMN location TEXT")
 
     def ensure_owner(self, owner_id: int):
         if not owner_id or owner_id <= 0:
@@ -171,6 +174,7 @@ class Database:
         training_time: str,
         capacity: int,
         level: str,
+        location: str,
         created_by: int,
         publish_at: str | None = None,
         publish_status: str = "published",
@@ -179,17 +183,18 @@ class Database:
             cursor = conn.execute(
                 """
                 INSERT INTO trainings (
-                    training_date, training_time, capacity, level,
+                    training_date, training_time, capacity, level, location,
                     status, created_by, created_at,
                     publish_at, publish_status
                 )
-                VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
                 """,
                 (
                     training_date,
                     training_time,
                     capacity,
                     level,
+                    location,
                     created_by,
                     now_iso(),
                     publish_at,
@@ -240,6 +245,113 @@ class Database:
                 """,
                 (now_iso(), training_id),
             )
+
+    def set_capacity_and_rebalance(self, training_id: int, new_capacity: int):
+        """Update training capacity and rebalance active/waiting registrations.
+
+        Returns dict with lists:
+        - demoted: registrations moved from active -> waiting
+        - promoted: registrations moved from waiting -> active
+        """
+        if new_capacity <= 0 or new_capacity > 200:
+            raise ValueError("new_capacity must be in 1..200")
+
+        with self._connect() as conn:
+            training = conn.execute(
+                "SELECT * FROM trainings WHERE id = ?",
+                (training_id,),
+            ).fetchone()
+            if not training:
+                return {"ok": False, "reason": "training_not_found"}
+
+            if training["status"] != "open":
+                return {"ok": False, "reason": "training_closed"}
+
+            conn.execute(
+                "UPDATE trainings SET capacity = ? WHERE id = ?",
+                (new_capacity, training_id),
+            )
+
+            active_count_row = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM registrations
+                WHERE training_id = ?
+                  AND status = 'active'
+                """,
+                (training_id,),
+            ).fetchone()
+            active_count = int(active_count_row["cnt"]) if active_count_row else 0
+
+            demoted_ids: list[int] = []
+            promoted_ids: list[int] = []
+
+            # If capacity decreased below active count: demote tail of active list.
+            if active_count > new_capacity:
+                to_demote = active_count - new_capacity
+                rows = conn.execute(
+                    """
+                    SELECT id
+                    FROM registrations
+                    WHERE training_id = ?
+                      AND status = 'active'
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (training_id, to_demote),
+                ).fetchall()
+                demoted_ids = [int(r["id"]) for r in rows]
+                if demoted_ids:
+                    conn.executemany(
+                        "UPDATE registrations SET status = 'waiting' WHERE id = ?",
+                        [(rid,) for rid in demoted_ids],
+                    )
+
+            # If capacity increased: promote from waiting into active.
+            # Recompute active count after possible demotions.
+            active_count_row = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM registrations
+                WHERE training_id = ?
+                  AND status = 'active'
+                """,
+                (training_id,),
+            ).fetchone()
+            active_count = int(active_count_row["cnt"]) if active_count_row else 0
+
+            while active_count < new_capacity:
+                promoted = self._promote_first_waiting_conn(conn, training_id)
+                if not promoted:
+                    break
+                promoted_ids.append(int(promoted["id"]))
+                active_count += 1
+
+            self._normalize_numbers_conn(conn, training_id)
+
+            demoted = []
+            if demoted_ids:
+                placeholders = ",".join(["?"] * len(demoted_ids))
+                rows = conn.execute(
+                    f"SELECT * FROM registrations WHERE id IN ({placeholders})",
+                    demoted_ids,
+                ).fetchall()
+                demoted = [dict(r) for r in rows]
+
+            promoted = []
+            if promoted_ids:
+                placeholders = ",".join(["?"] * len(promoted_ids))
+                rows = conn.execute(
+                    f"SELECT * FROM registrations WHERE id IN ({placeholders})",
+                    promoted_ids,
+                ).fetchall()
+                promoted = [dict(r) for r in rows]
+
+            # Sort by queue_number for nicer messaging.
+            demoted.sort(key=lambda r: (r.get("queue_number") or 0, r.get("id") or 0))
+            promoted.sort(key=lambda r: (r.get("queue_number") or 0, r.get("id") or 0))
+
+            return {"ok": True, "demoted": demoted, "promoted": promoted}
 
     def get_counts(self, training_id: int):
         result = {"active": 0, "waiting": 0}

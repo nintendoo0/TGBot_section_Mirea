@@ -27,8 +27,17 @@ class CreateTrainingStates(StatesGroup):
     waiting_for_time = State()
     waiting_for_capacity = State()
     waiting_for_level = State()
+    waiting_for_location = State()
     waiting_for_publish_time = State()
     waiting_for_confirm = State()
+
+
+class CloseTrainingStates(StatesGroup):
+    waiting_for_post_confirm = State()
+
+
+class EditTrainingStates(StatesGroup):
+    waiting_for_capacity = State()
 
 
 def normalize_spaces(text: str) -> str:
@@ -93,9 +102,12 @@ def parse_fio(text: str) -> str | None:
 
 
 def build_training_brief(training: dict) -> str:
+    location = training.get("location")
+    location_line = f"Место: {location}" if location else "Место: не указано"
     return (
         f"Дата: {training['training_date']}\n"
         f"Время: {training['training_time']}\n"
+        f"{location_line}\n"
         f"Уровень: {training['level']}\n"
         f"Лимит мест: {training['capacity']}"
     )
@@ -153,9 +165,10 @@ def users_can_register(training: dict | None) -> bool:
 
 def scheduled_registration_text(training: dict) -> str:
     publish_at = training.get("publish_at")
-    when = f"Публикация (MSK): {publish_at}" if publish_at else "Публикация: позже"
+    when = f"Публикация (MSK): {publish_at}" if publish_at else "Публикация: вручную"
     return (
-        "ℹ️ Запись уже открыта, но пост в канале ещё не опубликован.\n"
+        "ℹ️ Запись открыта.\n"
+        "Пост в канале публикуется вручную администратором (возможно, позже).\n"
         "Это не мешает записываться через сообщения каналу.\n\n"
         f"{build_training_brief(training)}\n"
         f"{when}\n\n"
@@ -208,6 +221,7 @@ def private_help_text(user_id: int) -> str:
                 "/training — показать текущую тренировку",
                 "/list — основной список",
                 "/waiting — лист ожидания",
+                "/edit_training — изменить лимит мест",
                 "/kick a3 — удалить №3 из основного списка",
                 "/kick w3 — удалить №3 из листа ожидания",
                 "/admins — список админов",
@@ -343,9 +357,28 @@ async def state_training_level(message: Message, state: FSMContext):
         return
 
     await state.update_data(level=level)
+    await state.set_state(CreateTrainingStates.waiting_for_location)
+    await message.answer(
+        "Введите место проведения тренировки.\n"
+        "Пример: Спортзал МИРЭА, корпус А, зал 2"
+    )
+
+
+@dp.message(CreateTrainingStates.waiting_for_location, F.chat.type == "private")
+async def state_training_location(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав.")
+        return
+
+    location = normalize_spaces(message.text or "")
+    if not location:
+        await message.answer("Место не может быть пустым. Пример: Спортзал МИРЭА, зал 2")
+        return
+
+    await state.update_data(location=location)
     await state.set_state(CreateTrainingStates.waiting_for_publish_time)
     await message.answer(
-        "Когда опубликовать пост в канале?\n\n"
+        "Когда вы планируете опубликовать пост в канале?\n\n"
         "Напишите:\n"
         "• сразу\n"
         "или\n"
@@ -364,7 +397,7 @@ async def state_training_publish_time(message: Message, state: FSMContext):
     lower = text.lower()
 
     if lower in ("сразу", "now", "сейчас"):
-        await state.update_data(publish_at=None, publish_status="published")
+        await state.update_data(publish_at=None, publish_status="manual")
     else:
         dt = parse_publish_datetime_msk(text)
         if not dt:
@@ -379,20 +412,21 @@ async def state_training_publish_time(message: Message, state: FSMContext):
             await message.answer("Время публикации должно быть в будущем (по Москве).")
             return
 
-        await state.update_data(publish_at=to_iso(dt), publish_status="scheduled")
+        await state.update_data(publish_at=to_iso(dt), publish_status="manual_scheduled")
 
     data = await state.get_data()
 
     publish_line = (
-        "Публикация: сразу"
+        "Публикация: вручную"
         if not data.get("publish_at")
-        else f"Публикация (MSK): {data['publish_at']}"
+        else f"План публикации (MSK): {data['publish_at']} (вручную)"
     )
 
     preview = (
         "Проверьте данные:\n\n"
         f"Дата: {data['training_date']}\n"
         f"Время: {data['training_time']}\n"
+        f"Место: {data['location']}\n"
         f"Лимит: {data['capacity']}\n"
         f"Уровень: {data['level']}\n"
         f"{publish_line}\n\n"
@@ -421,50 +455,33 @@ async def state_training_confirm(message: Message, state: FSMContext, bot: Bot):
         training_time=data["training_time"],
         capacity=data["capacity"],
         level=data["level"],
+        location=data["location"],
         created_by=message.from_user.id,
         publish_at=data.get("publish_at"),
         publish_status=data.get("publish_status") or "published",
     )
 
     training = db.get_training_by_id(training_id)
-
-    if training.get("publish_status") == "scheduled":
-        await state.clear()
-        await message.answer(
-            "Запись создана и будет опубликована позже.\n\n"
-            f"{build_training_brief(training)}\n"
-            f"Публикация (MSK): {training['publish_at']}"
-        )
-
-        await notify_admins(
-            bot,
-            "🕓 Запись создана и запланирована к публикации.\n\n"
-            f"{build_training_brief(training)}\n"
-            f"Публикация (MSK): {training['publish_at']}",
-            exclude_user_id=message.from_user.id,
-        )
-        return
-
-    try:
-        sent = await bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=build_channel_post(training),
-        )
-    except Exception as e:
-        db.delete_training(training_id)
-        await state.clear()
-        await message.answer(
-            "Не удалось опубликовать пост в канал.\n"
-            f"Проверь CHANNEL_ID и права бота.\n\nОшибка: {e}"
-        )
-        return
-
-    db.set_channel_message_id(training_id, sent.message_id)
     await state.clear()
 
+    publish_note = (
+        f"План публикации (MSK): {training['publish_at']}"
+        if training.get("publish_at")
+        else "Публикация: вручную (когда будете готовы)"
+    )
+
     await message.answer(
-        "Запись открыта.\n\n"
-        f"{build_training_brief(training)}"
+        "Запись открыта.\n"
+        "Бот не публикует посты в канал автоматически — я отправлю вам готовый текст для публикации.\n\n"
+        f"{build_training_brief(training)}\n"
+        f"{publish_note}"
+    )
+
+    post_text = build_channel_post(training)
+    await notify_admins(
+        bot,
+        "Текст поста для канала (скопируйте и опубликуйте/запланируйте в Telegram):\n\n" + post_text,
+        exclude_user_id=None,
     )
 
     await notify_admins(
@@ -476,7 +493,7 @@ async def state_training_confirm(message: Message, state: FSMContext, bot: Bot):
 
 
 @dp.message(Command("close_training"), F.chat.type == "private")
-async def cmd_close_training(message: Message, bot: Bot):
+async def cmd_close_training(message: Message, bot: Bot, state: FSMContext):
     if not is_admin(message.from_user.id):
         await message.answer("У вас нет прав для этой команды.")
         return
@@ -486,17 +503,60 @@ async def cmd_close_training(message: Message, bot: Bot):
         await message.answer("Сейчас нет открытой записи.")
         return
 
+    await state.clear()
+    await state.update_data(training=training)
+    await state.set_state(CloseTrainingStates.waiting_for_post_confirm)
+    await message.answer(
+        "Закрыть запись на тренировку?\n\n"
+        f"{build_training_brief(training)}\n\n"
+        "Опубликовать пост об отмене/закрытии в канал?\n"
+        "Ответьте: Да / Нет (или /cancel)"
+    )
+
+
+@dp.message(CloseTrainingStates.waiting_for_post_confirm, F.chat.type == "private")
+async def state_close_training_post_confirm(message: Message, bot: Bot, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав.")
+        return
+
+    text = normalize_spaces(message.text or "").lower()
+    if text in {"/cancel", "cancel", "отмена"}:
+        await state.clear()
+        await message.answer("Закрытие отменено.")
+        return
+
+    if text in {"да", "д", "yes", "y"}:
+        should_post = True
+    elif text in {"нет", "н", "no", "n"}:
+        should_post = False
+    else:
+        await message.answer("Пожалуйста, ответьте: Да или Нет (или /cancel)")
+        return
+
+    data = await state.get_data()
+    training = data.get("training")
+    if not training:
+        await state.clear()
+        await message.answer("Не удалось найти тренировку для закрытия. Повторите /close_training.")
+        return
+
     db.close_training(training["id"])
 
-    try:
-        await bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=build_channel_close_post(training),
+    if should_post:
+        close_post_text = build_channel_close_post(training)
+        await notify_admins(
+            bot,
+            "Текст поста о закрытии/отмене для канала (скопируйте и опубликуйте/запланируйте в Telegram):\n\n"
+            + close_post_text,
+            exclude_user_id=None,
         )
-    except Exception as e:
-        logging.warning("Не удалось отправить пост о закрытии: %s", e)
 
-    await message.answer("Запись закрыта.")
+    await state.clear()
+    await message.answer(
+        "Запись закрыта."
+        + (" Текст поста разослан админам." if should_post else "")
+    )
     await notify_admins(
         bot,
         "⛔ Запись на тренировку закрыта.\n\n"
@@ -519,11 +579,10 @@ async def cmd_training(message: Message):
     counts = db.get_counts(training["id"])
 
     publish_status = training.get("publish_status", "published")
-    publish_line = (
-        "Публикация: уже опубликовано"
-        if publish_status == "published"
-        else f"Публикация (MSK): {training.get('publish_at') or 'не задано'}"
-    )
+    if training.get("publish_at"):
+        publish_line = f"План публикации (MSK): {training.get('publish_at')} (вручную)"
+    else:
+        publish_line = "Публикация: вручную"
 
     availability_line = (
         "Запись для участников: открыта"
@@ -537,6 +596,117 @@ async def cmd_training(message: Message):
         f"{format_counts(training, counts)}\n\n"
         f"{publish_line}\n"
         f"{availability_line}"
+    )
+
+
+@dp.message(Command("edit_training"), F.chat.type == "private")
+async def cmd_edit_training(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав для этой команды.")
+        return
+
+    training = db.get_open_training()
+    if not training:
+        await message.answer("Сейчас нет открытой тренировки.")
+        return
+
+    await state.clear()
+    await state.update_data(training_id=training["id"], old_capacity=training["capacity"])
+    await state.set_state(EditTrainingStates.waiting_for_capacity)
+
+    await message.answer(
+        "Изменение лимита мест.\n\n"
+        f"{build_training_brief(training)}\n\n"
+        "Введите новый лимит (1–200) или /cancel.\n"
+        "Важно: если уменьшить лимит ниже числа участников в основном списке, "
+        "часть людей будет перенесена в лист ожидания."
+    )
+
+
+@dp.message(EditTrainingStates.waiting_for_capacity, F.chat.type == "private")
+async def state_edit_training_capacity(message: Message, state: FSMContext, bot: Bot):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав.")
+        return
+
+    new_capacity = parse_capacity(message.text or "")
+    if new_capacity is None:
+        await message.answer("Введите целое число от 1 до 200 (или /cancel)")
+        return
+
+    data = await state.get_data()
+    training_id = data.get("training_id")
+    old_capacity = int(data.get("old_capacity") or 0)
+
+    training = db.get_open_training()
+    if not training or training.get("id") != training_id:
+        await state.clear()
+        await message.answer("Не удалось найти открытую тренировку. Повторите /edit_training.")
+        return
+
+    if new_capacity == old_capacity:
+        await state.clear()
+        await message.answer("Лимит не изменился.")
+        return
+
+    result = db.set_capacity_and_rebalance(training_id=training_id, new_capacity=new_capacity)
+    await state.clear()
+
+    if not result.get("ok"):
+        await message.answer("Не удалось изменить лимит. Попробуйте ещё раз.")
+        return
+
+    # Re-fetch training to reflect updated capacity
+    training = db.get_training_by_id(training_id)
+
+    demoted = result.get("demoted") or []
+    promoted = result.get("promoted") or []
+
+    await message.answer(
+        "Лимит обновлён.\n\n"
+        f"Было: {old_capacity}\n"
+        f"Стало: {new_capacity}\n\n"
+        f"Перенесено в ожидание: {len(demoted)}\n"
+        f"Переведено в основной список: {len(promoted)}"
+    )
+
+    # Notify affected users in channel DMs
+    for item in demoted:
+        try:
+            await send_to_dm_topic(
+                bot,
+                item["dm_chat_id"],
+                item["dm_topic_id"],
+                "⚠️ Изменился лимит мест. Вы перенесены в лист ожидания.\n\n"
+                f"{build_training_brief(training)}\n"
+                f"Ваш номер в ожидании: {item['queue_number']}\n\n"
+                "Если вы передумали — отправьте: Отмена",
+            )
+        except Exception as e:
+            logging.warning("Не удалось уведомить пользователя о переносе в ожидание (id=%s): %s", item.get("user_id"), e)
+
+    for item in promoted:
+        try:
+            await send_to_dm_topic(
+                bot,
+                item["dm_chat_id"],
+                item["dm_topic_id"],
+                "✅ Освободилось место. Вы переведены в основной список.\n\n"
+                f"{build_training_brief(training)}\n"
+                f"Ваш номер в основном списке: {item['queue_number']}\n\n"
+                "Команда: Мой номер",
+            )
+        except Exception as e:
+            logging.warning("Не удалось уведомить пользователя о переводе в основной список (id=%s): %s", item.get("user_id"), e)
+
+    await notify_admins(
+        bot,
+        "ℹ️ Изменён лимит мест тренировки.\n\n"
+        f"{build_training_brief(training)}\n\n"
+        f"Было: {old_capacity} → Стало: {new_capacity}\n"
+        f"Перенесено в ожидание: {len(demoted)}\n"
+        f"Переведено в основной список: {len(promoted)}",
+        exclude_user_id=None,
     )
 
 
@@ -721,7 +891,18 @@ async def handle_channel_direct_messages(message: Message, bot: Bot):
             "Пример: Секция Иванов Иван Иванович",
         )
         return
-    if is_admin(message.from_user.id):
+
+    # В некоторых режимах Telegram может прислать сообщение без from_user (например, анонимно).
+    # Для регистрации нужен user_id, поэтому просим отправить сообщение от своего аккаунта.
+    if not message.from_user:
+        await reply_to_channel_dm(
+            bot,
+            message,
+            "Не удалось определить отправителя сообщения.\n"
+            "Похоже, сообщение отправлено анонимно.\n\n"
+            "Для записи отправьте сообщение НЕ анонимно от своего аккаунта:\n"
+            "Секция Фамилия Имя Отчество",
+        )
         return
     
     text = normalize_spaces(message.text)
@@ -943,38 +1124,10 @@ async def handle_channel_direct_messages(message: Message, bot: Bot):
 
 
 async def publisher_loop(bot: Bot):
+    # Раньше здесь была авто-публикация в канал по расписанию.
+    # Сейчас бот посты в канал НЕ публикует (вы публикуете вручную через Telegram).
     while True:
-        try:
-            now_value = to_iso(moscow_now())
-            due = db.get_scheduled_trainings_due(now_value)
-
-            for training in due:
-                try:
-                    sent = await bot.send_message(
-                        chat_id=CHANNEL_ID,
-                        text=build_channel_post(training),
-                    )
-                except Exception as e:
-                    logging.warning(
-                        "Не удалось опубликовать запланированный пост (training_id=%s): %s",
-                        training["id"],
-                        e,
-                    )
-                    continue
-
-                db.set_channel_message_id(training["id"], sent.message_id)
-                db.mark_training_published(training["id"])
-
-                await notify_admins(
-                    bot,
-                    "🟢 Опубликована запланированная запись на тренировку.\n\n"
-                    f"{build_training_brief(training)}",
-                    exclude_user_id=None,
-                )
-        except Exception as e:
-            logging.warning("publisher_loop: %s", e)
-
-        await asyncio.sleep(20)
+        await asyncio.sleep(3600)
 
 
 async def main():
@@ -982,7 +1135,10 @@ async def main():
         raise ValueError("Укажи BOT_TOKEN в config.py")
 
     bot = Bot(BOT_TOKEN)
-    asyncio.create_task(publisher_loop(bot))
+    # Telegram хранит непрочитанные апдейты, пока бот выключен.
+    # При запуске polling забирает их и начинает обрабатывать «старые» сообщения.
+    # Если это нежелательно — сбрасываем очередь апдейтов при старте.
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 
