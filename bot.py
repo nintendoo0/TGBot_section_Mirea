@@ -1,12 +1,21 @@
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 
 from config import BOT_TOKEN, CHANNEL_ID, OWNER_ID, DB_PATH
 from database import Database
@@ -38,6 +47,18 @@ class CloseTrainingStates(StatesGroup):
 
 class EditTrainingStates(StatesGroup):
     waiting_for_capacity = State()
+
+
+class AdminPanelStates(StatesGroup):
+    waiting_for_kick_number = State()
+    waiting_for_ban_user_id = State()
+    waiting_for_ban_days = State()
+    waiting_for_ban_reason = State()
+    waiting_for_unban_user_id = State()
+    waiting_for_add_admin_user_id = State()
+    waiting_for_remove_admin_user_id = State()
+    waiting_for_allow_reregister_user_id = State()
+    waiting_for_disallow_reregister_user_id = State()
 
 
 def normalize_spaces(text: str) -> str:
@@ -216,6 +237,8 @@ def private_help_text(user_id: int) -> str:
     if is_admin(user_id):
         base.extend(
             [
+                "/panel — панель управления (кнопки)",
+                "/hide_panel — скрыть панель кнопок",
                 "/new_training — открыть новую запись (сразу или по расписанию)",
                 "/close_training — закрыть текущую запись",
                 "/training — показать текущую тренировку",
@@ -224,6 +247,11 @@ def private_help_text(user_id: int) -> str:
                 "/edit_training — изменить лимит мест",
                 "/kick a3 — удалить №3 из основного списка",
                 "/kick w3 — удалить №3 из листа ожидания",
+                "/ban 123456789 7 причина — забанить (дни=0/нет → навсегда)",
+                "/unban 123456789 — разбанить",
+                "/bans — список банов",
+                "/allow_reregister 123456789 — разрешить повторную запись на текущую тренировку",
+                "/disallow_reregister 123456789 — запретить повторную запись на текущую тренировку",
                 "/admins — список админов",
                 "/cancel — отменить текущий пошаговый ввод",
             ]
@@ -238,6 +266,119 @@ def private_help_text(user_id: int) -> str:
         )
 
     return "\n".join(base)
+
+
+def build_admin_panel_kb(user_id: int) -> InlineKeyboardMarkup:
+    keyboard: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(text="ℹ️ Тренировка", callback_data="ap:training"),
+            InlineKeyboardButton(text="🆔 Мой id", callback_data="ap:my_id"),
+        ],
+        [
+            InlineKeyboardButton(text="➕ Новая запись", callback_data="ap:new_training"),
+            InlineKeyboardButton(text="⛔ Закрыть запись", callback_data="ap:close_training"),
+        ],
+        [
+            InlineKeyboardButton(text="✏️ Лимит мест", callback_data="ap:edit_training"),
+            InlineKeyboardButton(text="👮 Админы", callback_data="ap:admins"),
+        ],
+        [
+            InlineKeyboardButton(text="📋 Основной список", callback_data="ap:list_active"),
+            InlineKeyboardButton(text="🕒 Лист ожидания", callback_data="ap:list_waiting"),
+        ],
+        [
+            InlineKeyboardButton(text="🗑 Удалить из основного", callback_data="ap:kick_active"),
+            InlineKeyboardButton(text="🗑 Удалить из ожидания", callback_data="ap:kick_waiting"),
+        ],
+        [
+            InlineKeyboardButton(text="⛔ Бан", callback_data="ap:ban"),
+            InlineKeyboardButton(text="✅ Разбан", callback_data="ap:unban"),
+            InlineKeyboardButton(text="📄 Баны", callback_data="ap:bans"),
+        ],
+        [
+            InlineKeyboardButton(text="❓ Команды", callback_data="ap:help"),
+        ],
+    ]
+
+    if is_owner(user_id):
+        keyboard.insert(
+            3,
+            [
+                InlineKeyboardButton(text="➕ Добавить админа", callback_data="ap:add_admin"),
+                InlineKeyboardButton(text="➖ Удалить админа", callback_data="ap:remove_admin"),
+            ],
+        )
+
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def build_admin_panel_reply_kb(user_id: int) -> ReplyKeyboardMarkup:
+    rows: list[list[KeyboardButton]] = [
+        [
+            KeyboardButton(text="/training"),
+            KeyboardButton(text="/list"),
+            KeyboardButton(text="/waiting"),
+        ],
+        [
+            KeyboardButton(text="/new_training"),
+            KeyboardButton(text="/close_training"),
+        ],
+        [
+            KeyboardButton(text="/edit_training"),
+            KeyboardButton(text="🗑 Кик (основной)"),
+            KeyboardButton(text="🗑 Кик (ожидание)"),
+        ],
+        [
+            KeyboardButton(text="⛔ Бан"),
+            KeyboardButton(text="✅ Разбан"),
+            KeyboardButton(text="/bans"),
+        ],
+        [
+            KeyboardButton(text="✅ Разрешить перезапись"),
+            KeyboardButton(text="⛔ Запретить перезапись"),
+        ],
+        [
+            KeyboardButton(text="/admins"),
+            KeyboardButton(text="/help"),
+            KeyboardButton(text="/my_id"),
+        ],
+    ]
+
+    if is_owner(user_id):
+        rows.insert(
+            4,
+            [
+                KeyboardButton(text="➕ Добавить админа"),
+                KeyboardButton(text="➖ Удалить админа"),
+            ],
+        )
+
+    rows.append([KeyboardButton(text="/cancel"), KeyboardButton(text="❌ Скрыть панель")])
+
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Выберите действие…",
+    )
+
+
+def _parse_user_id(text: str) -> int | None:
+    raw = (text or "").strip()
+    if raw.lower().startswith("id "):
+        raw = raw[3:].strip()
+    if not raw.isdigit():
+        return None
+    value = int(raw)
+    return value if value > 0 else None
+
+
+def _format_ban_text(ban: dict) -> str:
+    until = ban.get("banned_until")
+    reason = (ban.get("reason") or "").strip()
+    when = f"до {until}" if until else "навсегда"
+    base = f"⛔ Вам запрещена запись ({when})."
+    return base + (f"\nПричина: {reason}" if reason else "")
 
 
 @dp.message(CommandStart(), F.chat.type == "private")
@@ -261,6 +402,637 @@ async def cmd_start(message: Message):
 @dp.message(Command("help"), F.chat.type == "private")
 async def cmd_help(message: Message):
     await message.answer(private_help_text(message.from_user.id))
+
+
+@dp.message(Command("panel"), F.chat.type == "private")
+async def cmd_panel(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав для этой команды.")
+        return
+    await message.answer(
+        "Панель управления записью (клавиатура снизу):",
+        reply_markup=build_admin_panel_reply_kb(message.from_user.id),
+    )
+
+
+@dp.message(Command("hide_panel"), F.chat.type == "private")
+async def cmd_hide_panel(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав для этой команды.")
+        return
+    await message.answer("Панель скрыта.", reply_markup=ReplyKeyboardRemove())
+
+
+@dp.message(F.text == "❌ Скрыть панель", F.chat.type == "private")
+async def hide_panel_button(message: Message):
+    await cmd_hide_panel(message)
+
+
+@dp.message(F.text == "🗑 Кик (основной)", F.chat.type == "private")
+async def panel_kick_active(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав.")
+        return
+    await state.clear()
+    await state.update_data(ap_list_name="active")
+    await state.set_state(AdminPanelStates.waiting_for_kick_number)
+    await message.answer("Введите номер участника (например 3). Можно отменить: /cancel")
+
+
+@dp.message(F.text == "🗑 Кик (ожидание)", F.chat.type == "private")
+async def panel_kick_waiting(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав.")
+        return
+    await state.clear()
+    await state.update_data(ap_list_name="waiting")
+    await state.set_state(AdminPanelStates.waiting_for_kick_number)
+    await message.answer("Введите номер участника (например 3). Можно отменить: /cancel")
+
+
+@dp.message(F.text == "⛔ Бан", F.chat.type == "private")
+async def panel_ban(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав.")
+        return
+    await state.clear()
+    await state.set_state(AdminPanelStates.waiting_for_ban_user_id)
+    await message.answer("Введите user_id пользователя (числом). Можно отменить: /cancel")
+
+
+@dp.message(F.text == "✅ Разбан", F.chat.type == "private")
+async def panel_unban(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав.")
+        return
+    await state.clear()
+    await state.set_state(AdminPanelStates.waiting_for_unban_user_id)
+    await message.answer("Введите user_id для разбана (числом). Можно отменить: /cancel")
+
+
+@dp.message(F.text == "✅ Разрешить перезапись", F.chat.type == "private")
+async def panel_allow_reregister(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав.")
+        return
+    await state.clear()
+    await state.set_state(AdminPanelStates.waiting_for_allow_reregister_user_id)
+    await message.answer("Введите user_id, которому разрешить повторную запись. Можно отменить: /cancel")
+
+
+@dp.message(F.text == "⛔ Запретить перезапись", F.chat.type == "private")
+async def panel_disallow_reregister(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав.")
+        return
+    await state.clear()
+    await state.set_state(AdminPanelStates.waiting_for_disallow_reregister_user_id)
+    await message.answer("Введите user_id, которому запретить повторную запись. Можно отменить: /cancel")
+
+
+@dp.message(F.text == "➕ Добавить админа", F.chat.type == "private")
+async def panel_add_admin(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await message.answer("Добавлять админов может только владелец.")
+        return
+    await state.clear()
+    await state.set_state(AdminPanelStates.waiting_for_add_admin_user_id)
+    await message.answer("Введите user_id для добавления админа (числом). Можно отменить: /cancel")
+
+
+@dp.message(F.text == "➖ Удалить админа", F.chat.type == "private")
+async def panel_remove_admin(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await message.answer("Удалять админов может только владелец.")
+        return
+    await state.clear()
+    await state.set_state(AdminPanelStates.waiting_for_remove_admin_user_id)
+    await message.answer("Введите user_id для удаления админа (числом). Можно отменить: /cancel")
+
+
+@dp.callback_query(F.data.startswith("ap:"))
+async def admin_panel_callback(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав.", show_alert=True)
+        return
+
+    action = (callback.data or "")[3:]
+    training = db.get_open_training()
+
+    if action == "help":
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer(private_help_text(callback.from_user.id))
+        return
+
+    if action == "my_id":
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer(f"Ваш user_id: {callback.from_user.id}")
+        return
+
+    if action == "admins":
+        admins = db.list_admins()
+        await callback.answer()
+        if not callback.message:
+            return
+        if not admins:
+            await callback.message.answer("Список админов пуст.")
+            return
+        lines = ["Админы:"]
+        for admin in admins:
+            lines.append(f"- {admin['user_id']} ({admin['role']})")
+        await callback.message.answer("\n".join(lines))
+        return
+
+    if action == "bans":
+        await callback.answer()
+        if not callback.message:
+            return
+        rows = db.list_bans()
+        if not rows:
+            await callback.message.answer("Активных банов нет.")
+            return
+        lines = ["Активные баны:"]
+        for ban in rows[:50]:
+            until = ban.get("banned_until") or "навсегда"
+            reason = (ban.get("reason") or "").strip()
+            tail = f" — {reason}" if reason else ""
+            lines.append(f"- {ban['user_id']}: {until}{tail}")
+        await callback.message.answer("\n".join(lines))
+        return
+
+    if action == "add_admin":
+        if not is_owner(callback.from_user.id):
+            await callback.answer("Только владелец.", show_alert=True)
+            return
+        await state.clear()
+        await state.set_state(AdminPanelStates.waiting_for_add_admin_user_id)
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer("Введите user_id для добавления админа (числом). Можно отменить: /cancel")
+        return
+
+    if action == "remove_admin":
+        if not is_owner(callback.from_user.id):
+            await callback.answer("Только владелец.", show_alert=True)
+            return
+        await state.clear()
+        await state.set_state(AdminPanelStates.waiting_for_remove_admin_user_id)
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer("Введите user_id для удаления админа (числом). Можно отменить: /cancel")
+        return
+
+    if action == "new_training":
+        if training:
+            await callback.answer()
+            if callback.message:
+                await callback.message.answer(
+                    "Сейчас уже есть открытая запись.\n"
+                    "Сначала закройте её командой /close_training."
+                )
+            return
+        await state.clear()
+        await state.set_state(CreateTrainingStates.waiting_for_date)
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer("Введите дату тренировки в формате ДД.ММ.ГГГГ")
+        return
+
+    if action == "close_training":
+        if not training:
+            await callback.answer()
+            if callback.message:
+                await callback.message.answer("Сейчас нет открытой записи.")
+            return
+        await state.clear()
+        await state.update_data(training=training)
+        await state.set_state(CloseTrainingStates.waiting_for_post_confirm)
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer(
+                "Закрыть запись на тренировку?\n\n"
+                f"{build_training_brief(training)}\n\n"
+                "Опубликовать пост об отмене/закрытии в канал?\n"
+                "Ответьте: Да / Нет (или /cancel)"
+            )
+        return
+
+    if action == "training":
+        await callback.answer()
+        if not callback.message:
+            return
+        if not training:
+            await callback.message.answer("Сейчас нет открытой тренировки.")
+            return
+        counts = db.get_counts(training["id"])
+        if training.get("publish_at"):
+            publish_line = f"План публикации (MSK): {training.get('publish_at')} (вручную)"
+        else:
+            publish_line = "Публикация: вручную"
+        availability_line = (
+            "Запись для участников: открыта"
+            if users_can_register(training)
+            else "Запись для участников: закрыта"
+        )
+        await callback.message.answer(
+            "Текущая открытая тренировка:\n\n"
+            f"{build_training_brief(training)}\n\n"
+            f"{format_counts(training, counts)}\n\n"
+            f"{publish_line}\n"
+            f"{availability_line}"
+        )
+        return
+
+    if action == "edit_training":
+        if not training:
+            await callback.answer()
+            if callback.message:
+                await callback.message.answer("Сейчас нет открытой тренировки.")
+            return
+        await state.clear()
+        await state.update_data(training_id=training["id"], old_capacity=training["capacity"])
+        await state.set_state(EditTrainingStates.waiting_for_capacity)
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer(
+                "Изменение лимита мест.\n\n"
+                f"{build_training_brief(training)}\n\n"
+                "Введите новый лимит (1–200) или /cancel.\n"
+                "Важно: если уменьшить лимит ниже числа участников в основном списке, "
+                "часть людей будет перенесена в лист ожидания."
+            )
+        return
+
+    if action in {"list_active", "list_waiting", "kick_active", "kick_waiting"} and not training:
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer("Сейчас нет открытой тренировки.")
+        return
+
+    if action == "list_active":
+        active = db.list_registrations(training["id"], "active")
+        counts = db.get_counts(training["id"])
+        text = (
+            "Основной список:\n"
+            f"{build_training_brief(training)}\n\n"
+            f"{format_counts(training, counts)}\n\n"
+            f"{render_registrations('Участники:', active)}"
+        )
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer(text)
+        return
+
+    if action == "list_waiting":
+        waiting = db.list_registrations(training["id"], "waiting")
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer(render_registrations("Лист ожидания:", waiting))
+        return
+
+    if action in {"kick_active", "kick_waiting"}:
+        await state.clear()
+        await state.update_data(ap_list_name="active" if action == "kick_active" else "waiting")
+        await state.set_state(AdminPanelStates.waiting_for_kick_number)
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer("Введите номер участника (например 3). Можно отменить: /cancel")
+        return
+
+    if action == "ban":
+        await state.clear()
+        await state.set_state(AdminPanelStates.waiting_for_ban_user_id)
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer("Введите user_id пользователя (числом). Можно отменить: /cancel")
+        return
+
+    if action == "unban":
+        await state.clear()
+        await state.set_state(AdminPanelStates.waiting_for_unban_user_id)
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer("Введите user_id для разбана (числом). Можно отменить: /cancel")
+        return
+
+    await callback.answer()
+
+
+@dp.message(AdminPanelStates.waiting_for_add_admin_user_id, F.chat.type == "private")
+async def admin_panel_add_admin(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await message.answer("Добавлять админов может только владелец.")
+        return
+
+    text = normalize_spaces(message.text or "")
+    if text.lower() in {"/cancel", "cancel", "отмена", "/отмена"}:
+        await state.clear()
+        await message.answer("Действие отменено.")
+        return
+
+    user_id = _parse_user_id(text)
+    if not user_id:
+        await message.answer("Введите user_id числом (например 123456789) или /cancel.")
+        return
+
+    _, info = db.add_admin(user_id, message.from_user.id)
+    await state.clear()
+    await message.answer(info)
+
+
+@dp.message(AdminPanelStates.waiting_for_remove_admin_user_id, F.chat.type == "private")
+async def admin_panel_remove_admin(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await message.answer("Удалять админов может только владелец.")
+        return
+
+    text = normalize_spaces(message.text or "")
+    if text.lower() in {"/cancel", "cancel", "отмена", "/отмена"}:
+        await state.clear()
+        await message.answer("Действие отменено.")
+        return
+
+    user_id = _parse_user_id(text)
+    if not user_id:
+        await message.answer("Введите user_id числом (например 123456789) или /cancel.")
+        return
+
+    _, info = db.remove_admin(user_id)
+    await state.clear()
+    await message.answer(info)
+
+
+@dp.message(AdminPanelStates.waiting_for_kick_number, F.chat.type == "private")
+async def admin_panel_kick_number(message: Message, bot: Bot, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав.")
+        return
+
+    text = normalize_spaces(message.text or "")
+    if text.lower() in {"/cancel", "cancel", "отмена", "/отмена"}:
+        await state.clear()
+        await message.answer("Действие отменено.")
+        return
+
+    training = db.get_open_training()
+    if not training:
+        await state.clear()
+        await message.answer("Сейчас нет открытой тренировки.")
+        return
+
+    data = await state.get_data()
+    list_name = data.get("ap_list_name")
+    if list_name not in ("active", "waiting"):
+        await state.clear()
+        await message.answer("Не удалось определить список. Откройте /panel заново.")
+        return
+
+    raw = text.lower()
+    if not raw.isdigit():
+        await message.answer("Введите номер числом (например 3) или /cancel.")
+        return
+
+    queue_number = int(raw)
+    if queue_number <= 0 or queue_number > 500:
+        await message.answer("Номер выглядит неверно. Введите число (например 3) или /cancel.")
+        return
+
+    result = db.admin_kick_by_queue(training["id"], list_name, queue_number, cancelled_by=message.from_user.id)
+    await state.clear()
+    if not result.get("ok"):
+        await message.answer("Не найден участник с таким номером в выбранном списке.")
+        return
+
+    removed = result["removed"]
+    promoted = result.get("promoted")
+
+    who = removed.get("fio") or f"id {removed.get('user_id')}"
+    await message.answer(f"Удалён(а): {who} из {list_name} (№{queue_number}).")
+
+    await notify_admins(
+        bot,
+        f"🗑 Админ удалил участника из {list_name}:\n{who} (№{queue_number})",
+        exclude_user_id=message.from_user.id,
+    )
+
+    try:
+        removed_place = "основного списка" if list_name == "active" else "листа ожидания"
+        await send_to_dm_topic(
+            bot,
+            removed["dm_chat_id"],
+            removed["dm_topic_id"],
+            "⛔ Ваша запись на тренировку отменена администратором.\n\n"
+            f"{build_training_brief(training)}\n\n"
+            f"Вы были удалены из {removed_place} (№{queue_number}).\n"
+            "Повторная запись на ЭТУ тренировку недоступна, пока админ не разрешит.",
+        )
+    except Exception as e:
+        logging.warning("Не удалось уведомить удалённого участника: %s", e)
+
+    if promoted:
+        try:
+            await send_to_dm_topic(
+                bot,
+                promoted["dm_chat_id"],
+                promoted["dm_topic_id"],
+                "✅ Для вас освободилось место.\n"
+                "Вы переведены из листа ожидания в основной список.\n"
+                f"Ваш новый номер: {promoted['queue_number']}",
+            )
+        except Exception as e:
+            logging.warning("Не удалось уведомить promoted user: %s", e)
+
+
+@dp.message(AdminPanelStates.waiting_for_ban_user_id, F.chat.type == "private")
+async def admin_panel_ban_user(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав.")
+        return
+
+    text = normalize_spaces(message.text or "")
+    if text.lower() in {"/cancel", "cancel", "отмена", "/отмена"}:
+        await state.clear()
+        await message.answer("Действие отменено.")
+        return
+
+    user_id = _parse_user_id(text)
+    if not user_id:
+        await message.answer("Введите user_id числом (например 123456789) или /cancel.")
+        return
+
+    await state.update_data(ap_ban_user_id=user_id)
+    await state.set_state(AdminPanelStates.waiting_for_ban_days)
+    await message.answer("На сколько дней бан? Введите число. 0 = навсегда.")
+
+
+@dp.message(AdminPanelStates.waiting_for_ban_days, F.chat.type == "private")
+async def admin_panel_ban_days(message: Message, state: FSMContext):
+    text = normalize_spaces(message.text or "")
+    if text.lower() in {"/cancel", "cancel", "отмена", "/отмена"}:
+        await state.clear()
+        await message.answer("Действие отменено.")
+        return
+
+    raw = text
+    if not raw.isdigit():
+        await message.answer("Введите число дней (например 7). 0 = навсегда. Или /cancel.")
+        return
+
+    days = int(raw)
+    if days < 0 or days > 3650:
+        await message.answer("Слишком большое/маленькое значение. Введите 0..3650.")
+        return
+
+    await state.update_data(ap_ban_days=days)
+    await state.set_state(AdminPanelStates.waiting_for_ban_reason)
+    await message.answer("Причина бана? Можно написать текст или '-' чтобы пропустить.")
+
+
+@dp.message(AdminPanelStates.waiting_for_ban_reason, F.chat.type == "private")
+async def admin_panel_ban_reason(message: Message, bot: Bot, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав.")
+        return
+
+    text = normalize_spaces(message.text or "")
+    if text.lower() in {"/cancel", "cancel", "отмена", "/отмена"}:
+        await state.clear()
+        await message.answer("Действие отменено.")
+        return
+
+    data = await state.get_data()
+    user_id = data.get("ap_ban_user_id")
+    days = int(data.get("ap_ban_days") or 0)
+    reason = text
+    if reason in {"-", "—", "нет", "none"}:
+        reason = ""
+
+    banned_until = None
+    if days > 0:
+        banned_until = (datetime.utcnow() + timedelta(days=days)).isoformat(timespec="seconds")
+
+    db.ban_user(user_id=user_id, banned_by=message.from_user.id, banned_until=banned_until, reason=reason or None)
+    await state.clear()
+
+    await message.answer(
+        "Готово. Пользователь забанен " + (f"на {days} дн." if days > 0 else "навсегда") + "."
+    )
+
+    try:
+        ban = db.get_active_ban(user_id)
+        if ban:
+            await bot.send_message(chat_id=user_id, text=_format_ban_text(ban))
+    except Exception:
+        pass
+
+
+@dp.message(AdminPanelStates.waiting_for_unban_user_id, F.chat.type == "private")
+async def admin_panel_unban_user(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав.")
+        return
+
+    text = normalize_spaces(message.text or "")
+    if text.lower() in {"/cancel", "cancel", "отмена", "/отмена"}:
+        await state.clear()
+        await message.answer("Действие отменено.")
+        return
+
+    user_id = _parse_user_id(text)
+    if not user_id:
+        await message.answer("Введите user_id числом (например 123456789) или /cancel.")
+        return
+
+    ok = db.unban_user(user_id)
+    await state.clear()
+    await message.answer("Разбан выполнен." if ok else "Активного бана не было.")
+
+
+@dp.message(Command("ban"), F.chat.type == "private")
+async def cmd_ban(message: Message, bot: Bot):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав для этой команды.")
+        return
+
+    parts = (message.text or "").split(maxsplit=3)
+    if len(parts) < 2:
+        await message.answer("Использование: /ban user_id [days] [reason]")
+        return
+
+    user_id = _parse_user_id(parts[1])
+    if not user_id:
+        await message.answer("user_id должен быть числом.")
+        return
+
+    days = 0
+    reason = ""
+    if len(parts) >= 3 and parts[2].isdigit():
+        days = int(parts[2])
+        if days < 0 or days > 3650:
+            await message.answer("days должен быть в диапазоне 0..3650")
+            return
+        if len(parts) == 4:
+            reason = normalize_spaces(parts[3])
+    else:
+        # days not provided; everything after user_id is reason
+        if len(parts) >= 3:
+            reason = normalize_spaces(" ".join(parts[2:]))
+
+    banned_until = None
+    if days > 0:
+        banned_until = (datetime.utcnow() + timedelta(days=days)).isoformat(timespec="seconds")
+
+    db.ban_user(user_id=user_id, banned_by=message.from_user.id, banned_until=banned_until, reason=reason or None)
+    await message.answer("Пользователь забанен.")
+
+    try:
+        ban = db.get_active_ban(user_id)
+        if ban:
+            await bot.send_message(chat_id=user_id, text=_format_ban_text(ban))
+    except Exception:
+        pass
+
+
+@dp.message(Command("unban"), F.chat.type == "private")
+async def cmd_unban(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав для этой команды.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /unban user_id")
+        return
+
+    user_id = _parse_user_id(parts[1])
+    if not user_id:
+        await message.answer("user_id должен быть числом.")
+        return
+
+    ok = db.unban_user(user_id)
+    await message.answer("Разбан выполнен." if ok else "Активного бана не было.")
+
+
+@dp.message(Command("bans"), F.chat.type == "private")
+async def cmd_bans(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав для этой команды.")
+        return
+
+    rows = db.list_bans()
+    if not rows:
+        await message.answer("Активных банов нет.")
+        return
+
+    lines = ["Активные баны:"]
+    for ban in rows[:50]:
+        until = ban.get("banned_until") or "навсегда"
+        reason = (ban.get("reason") or "").strip()
+        tail = f" — {reason}" if reason else ""
+        lines.append(f"- {ban['user_id']}: {until}{tail}")
+    await message.answer("\n".join(lines))
 
 
 @dp.message(Command("my_id"), F.chat.type == "private")
@@ -772,7 +1544,7 @@ async def cmd_kick(message: Message, bot: Bot):
     list_name = "active" if raw[0] == "a" else "waiting"
     queue_number = int(raw[1:])
 
-    result = db.admin_kick_by_queue(training["id"], list_name, queue_number)
+    result = db.admin_kick_by_queue(training["id"], list_name, queue_number, cancelled_by=message.from_user.id)
     if not result["ok"]:
         await message.answer("Не найден участник с таким номером в выбранном списке.")
         return
@@ -802,6 +1574,140 @@ async def cmd_kick(message: Message, bot: Bot):
         )
     except Exception as e:
         logging.warning("Не удалось уведомить удалённого участника: %s", e)
+
+
+@dp.message(Command("allow_reregister"), F.chat.type == "private")
+async def cmd_allow_reregister(message: Message, bot: Bot):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав для этой команды.")
+        return
+
+    training = db.get_open_training()
+    if not training:
+        await message.answer("Сейчас нет открытой тренировки.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /allow_reregister user_id")
+        return
+
+    user_id = _parse_user_id(parts[1])
+    if not user_id:
+        await message.answer("user_id должен быть числом.")
+        return
+
+    db.allow_reregister(training_id=training["id"], user_id=user_id, allowed_by=message.from_user.id)
+    await message.answer("Готово. Повторная запись разрешена для этого пользователя на текущую тренировку.")
+
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=(
+                "✅ Вам разрешили повторную запись на тренировку.\n\n"
+                f"{build_training_brief(training)}\n\n"
+                "Для записи отправьте в сообщения каналу: Секция ФИО"
+            ),
+        )
+    except Exception:
+        pass
+
+
+@dp.message(Command("disallow_reregister"), F.chat.type == "private")
+async def cmd_disallow_reregister(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав для этой команды.")
+        return
+
+    training = db.get_open_training()
+    if not training:
+        await message.answer("Сейчас нет открытой тренировки.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /disallow_reregister user_id")
+        return
+
+    user_id = _parse_user_id(parts[1])
+    if not user_id:
+        await message.answer("user_id должен быть числом.")
+        return
+
+    ok = db.disallow_reregister(training_id=training["id"], user_id=user_id)
+    await message.answer(
+        "Готово. Повторная запись запрещена." if ok else "Разрешения не было (и так запрещено)."
+    )
+
+
+@dp.message(AdminPanelStates.waiting_for_allow_reregister_user_id, F.chat.type == "private")
+async def admin_panel_allow_reregister(message: Message, bot: Bot, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав.")
+        return
+
+    text = normalize_spaces(message.text or "")
+    if text.lower() in {"/cancel", "cancel", "отмена", "/отмена"}:
+        await state.clear()
+        await message.answer("Действие отменено.")
+        return
+
+    training = db.get_open_training()
+    if not training:
+        await state.clear()
+        await message.answer("Сейчас нет открытой тренировки.")
+        return
+
+    user_id = _parse_user_id(text)
+    if not user_id:
+        await message.answer("Введите user_id числом (например 123456789) или /cancel.")
+        return
+
+    db.allow_reregister(training_id=training["id"], user_id=user_id, allowed_by=message.from_user.id)
+    await state.clear()
+    await message.answer("Готово. Повторная запись разрешена для этого пользователя на текущую тренировку.")
+
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=(
+                "✅ Вам разрешили повторную запись на тренировку.\n\n"
+                f"{build_training_brief(training)}\n\n"
+                "Для записи отправьте в сообщения каналу: Секция ФИО"
+            ),
+        )
+    except Exception:
+        pass
+
+
+@dp.message(AdminPanelStates.waiting_for_disallow_reregister_user_id, F.chat.type == "private")
+async def admin_panel_disallow_reregister(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("У вас нет прав.")
+        return
+
+    text = normalize_spaces(message.text or "")
+    if text.lower() in {"/cancel", "cancel", "отмена", "/отмена"}:
+        await state.clear()
+        await message.answer("Действие отменено.")
+        return
+
+    training = db.get_open_training()
+    if not training:
+        await state.clear()
+        await message.answer("Сейчас нет открытой тренировки.")
+        return
+
+    user_id = _parse_user_id(text)
+    if not user_id:
+        await message.answer("Введите user_id числом (например 123456789) или /cancel.")
+        return
+
+    ok = db.disallow_reregister(training_id=training["id"], user_id=user_id)
+    await state.clear()
+    await message.answer(
+        "Готово. Повторная запись запрещена." if ok else "Разрешения не было (и так запрещено)."
+    )
 
     if promoted:
         # уведомим поднятого из ожидания (в его DM-топик)
@@ -942,6 +1848,11 @@ async def handle_channel_direct_messages(message: Message, bot: Bot):
             await reply_to_channel_dm(bot, message, "Сейчас запись закрыта.")
             return
 
+        ban = db.get_active_ban(message.from_user.id)
+        if ban:
+            await reply_to_channel_dm(bot, message, _format_ban_text(ban))
+            return
+
         fio = parse_fio(text)
         if not fio:
             await reply_to_channel_dm(
@@ -964,6 +1875,20 @@ async def handle_channel_direct_messages(message: Message, bot: Bot):
         )
 
         if not result["ok"]:
+            if result["reason"] == "cancelled_block":
+                cancel_source = result.get("cancel_source")
+                if cancel_source == "admin":
+                    first_line = "⛔ Администратор отменил вашу запись на эту тренировку."
+                else:
+                    first_line = "⛔ Ваша запись на эту тренировку уже была отменена."
+
+                text_reply = (
+                    f"{first_line}\n"
+                    "Повторная запись сейчас запрещена.\n"
+                    "Админ может разрешить повторную запись, если нужно."
+                )
+                await reply_to_channel_dm(bot, message, text_reply)
+                return
             if result["reason"] == "already_registered":
                 if result["status"] == "active":
                     await reply_to_channel_dm(
@@ -1139,7 +2064,15 @@ async def main():
     # При запуске polling забирает их и начинает обрабатывать «старые» сообщения.
     # Если это нежелательно — сбрасываем очередь апдейтов при старте.
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+
+    retry_delay = 10
+    while True:
+        try:
+            await dp.start_polling(bot)
+            return
+        except TelegramNetworkError as e:
+            logging.warning("Telegram недоступен (%s). Повтор через %s сек...", e, retry_delay)
+            await asyncio.sleep(retry_delay)
 
 
 if __name__ == "__main__":

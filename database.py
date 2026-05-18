@@ -56,6 +56,22 @@ class Database:
                     cancelled_at TEXT,
                     FOREIGN KEY (training_id) REFERENCES trainings(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS bans (
+                    user_id INTEGER PRIMARY KEY,
+                    banned_until TEXT,
+                    reason TEXT,
+                    banned_by INTEGER,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS reentry_permissions (
+                    training_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    allowed_by INTEGER,
+                    allowed_at TEXT NOT NULL,
+                    PRIMARY KEY (training_id, user_id)
+                );
                 """
             )
 
@@ -72,6 +88,174 @@ class Database:
                 )
             if "location" not in columns:
                 conn.execute("ALTER TABLE trainings ADD COLUMN location TEXT")
+
+            reg_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(registrations)").fetchall()
+            }
+            if "cancel_source" not in reg_columns:
+                conn.execute("ALTER TABLE registrations ADD COLUMN cancel_source TEXT")
+            if "cancelled_by" not in reg_columns:
+                conn.execute("ALTER TABLE registrations ADD COLUMN cancelled_by INTEGER")
+
+    def allow_reregister(self, training_id: int, user_id: int, allowed_by: int | None = None):
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO reentry_permissions (training_id, user_id, allowed_by, allowed_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(training_id, user_id) DO UPDATE SET
+                    allowed_by = excluded.allowed_by,
+                    allowed_at = excluded.allowed_at
+                """,
+                (training_id, user_id, allowed_by, now_iso()),
+            )
+
+    def disallow_reregister(self, training_id: int, user_id: int) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM reentry_permissions WHERE training_id = ? AND user_id = ?",
+                (training_id, user_id),
+            )
+            return cur.rowcount > 0
+
+    def is_reregister_allowed(self, training_id: int, user_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM reentry_permissions
+                WHERE training_id = ? AND user_id = ?
+                LIMIT 1
+                """,
+                (training_id, user_id),
+            ).fetchone()
+            return row is not None
+
+    def get_cancel_block_source(self, training_id: int, user_id: int) -> str | None:
+        """Return blocking cancellation source: 'user' or 'admin', or None if not blocked.
+
+        Rules:
+        - If there is a cancelled record for this training => blocked unless re-entry is allowed
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT COALESCE(cancel_source, 'user') AS src
+                FROM registrations
+                WHERE training_id = ?
+                  AND user_id = ?
+                  AND status = 'cancelled'
+                """,
+                (training_id, user_id),
+            ).fetchall()
+            sources = {str(r["src"]).lower() for r in rows}
+
+        if not sources:
+            return None
+
+        # Admin can override any cancellation (including user's self-cancel).
+        if self.is_reregister_allowed(training_id, user_id):
+            return None
+
+        # Prefer reporting a concrete source for messaging.
+        if "admin" in sources:
+            return "admin"
+        return "user"
+
+    def get_active_ban(self, user_id: int):
+        """Return active ban dict or None.
+
+        If the ban is expired it will be removed automatically.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM bans WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if not row:
+                return None
+
+            ban = dict(row)
+            banned_until = ban.get("banned_until")
+            if not banned_until:
+                return ban
+
+            try:
+                until_dt = datetime.fromisoformat(banned_until)
+            except ValueError:
+                # If stored value is invalid, treat as permanent to avoid accidental bypass.
+                return ban
+
+            if until_dt <= datetime.utcnow():
+                conn.execute("DELETE FROM bans WHERE user_id = ?", (user_id,))
+                return None
+
+            return ban
+
+    def ban_user(
+        self,
+        user_id: int,
+        banned_by: int | None,
+        banned_until: str | None,
+        reason: str | None,
+    ):
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO bans (user_id, banned_until, reason, banned_by, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    banned_until = excluded.banned_until,
+                    reason = excluded.reason,
+                    banned_by = excluded.banned_by,
+                    created_at = excluded.created_at
+                """,
+                (user_id, banned_until, reason, banned_by, now_iso()),
+            )
+
+    def unban_user(self, user_id: int) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM bans WHERE user_id = ?", (user_id,))
+            return cur.rowcount > 0
+
+    def list_bans(self):
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id, banned_until, reason, banned_by, created_at
+                FROM bans
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+
+            now = datetime.utcnow()
+            active: list[dict] = []
+            to_delete: list[int] = []
+            for row in rows:
+                ban = dict(row)
+                banned_until = ban.get("banned_until")
+                if not banned_until:
+                    active.append(ban)
+                    continue
+                try:
+                    until_dt = datetime.fromisoformat(banned_until)
+                except ValueError:
+                    # Keep invalid values (treat as active) to avoid bypass.
+                    active.append(ban)
+                    continue
+                if until_dt <= now:
+                    to_delete.append(int(ban["user_id"]))
+                else:
+                    active.append(ban)
+
+            if to_delete:
+                conn.executemany(
+                    "DELETE FROM bans WHERE user_id = ?",
+                    [(uid,) for uid in to_delete],
+                )
+
+            return active
 
     def ensure_owner(self, owner_id: int):
         if not owner_id or owner_id <= 0:
@@ -389,6 +573,22 @@ class Database:
             ).fetchone()
             return dict(row) if row else None
 
+    def has_cancelled_registration(self, training_id: int, user_id: int) -> bool:
+        # Kept for backward compatibility; use get_cancel_block_source() in new logic.
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM registrations
+                WHERE training_id = ?
+                  AND user_id = ?
+                  AND status = 'cancelled'
+                LIMIT 1
+                """,
+                (training_id, user_id),
+            ).fetchone()
+            return row is not None
+
     def register_user(
         self,
         training_id: int,
@@ -402,6 +602,14 @@ class Database:
         training = self.get_training_by_id(training_id)
         if not training or training["status"] != "open":
             return {"ok": False, "reason": "training_closed"}
+
+        cancel_block_source = self.get_cancel_block_source(training_id, user_id)
+        if cancel_block_source:
+            return {
+                "ok": False,
+                "reason": "cancelled_block",
+                "cancel_source": cancel_block_source,
+            }
 
         existing = self.get_registration_for_user(training_id, user_id)
         if existing:
@@ -466,10 +674,10 @@ class Database:
             conn.execute(
                 """
                 UPDATE registrations
-                SET status = 'cancelled', cancelled_at = ?
+                SET status = 'cancelled', cancelled_at = ?, cancel_source = 'user', cancelled_by = ?
                 WHERE id = ?
                 """,
-                (now_iso(), registration["id"]),
+                (now_iso(), user_id, registration["id"]),
             )
 
             if registration["status"] == "active":
@@ -593,6 +801,7 @@ class Database:
         training_id: int,
         list_name: str,  # 'active' | 'waiting'
         queue_number: int,
+        cancelled_by: int | None = None,
     ):
         if list_name not in ("active", "waiting"):
             raise ValueError("list_name must be 'active' or 'waiting'")
@@ -617,10 +826,10 @@ class Database:
             conn.execute(
                 """
                 UPDATE registrations
-                SET status = 'cancelled', cancelled_at = ?
+                SET status = 'cancelled', cancelled_at = ?, cancel_source = 'admin', cancelled_by = ?
                 WHERE id = ?
                 """,
-                (now_iso(), row["id"]),
+                (now_iso(), cancelled_by, row["id"]),
             )
 
             promoted = None
